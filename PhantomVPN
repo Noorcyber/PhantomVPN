@@ -1,0 +1,205 @@
+#!/bin/sh
+#
+# ██████╗ ██╗  ██╗ █████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ███╗
+# ██╔══██╗██║  ██║██╔══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗ ████║
+# ██████╔╝███████║███████║██╔██╗ ██║   ██║   ██║   ██║██╔████╔██║
+# ██╔═══╝ ██╔══██║██╔══██║██║╚██╗██║   ██║   ██║   ██║██║╚██╔╝██║
+# ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
+# ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
+#
+# PHANTOM VPN ANALYZER
+# Datto/OpenWRT VPN Stability & Tunnel Diagnostics Tool
+#
+# Author: You
+# Version: 1.0
+#
+
+LOG_DIR="/tmp/phantomvpn"
+LOG_FILE="$LOG_DIR/phantomvpn.log"
+PING_TARGET="8.8.8.8"
+VPN_PEER="REMOTE_PEER_IP_HERE"
+MTU_TEST_HOST="1.1.1.1"
+
+mkdir -p $LOG_DIR
+
+clear
+
+echo "
+██████╗ ██╗  ██╗ █████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ███╗
+██╔══██╗██║  ██║██╔══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗ ████║
+██████╔╝███████║███████║██╔██╗ ██║   ██║   ██║   ██║██╔████╔██║
+██╔═══╝ ██╔══██║██╔══██║██║╚██╗██║   ██║   ██║   ██║██║╚██╔╝██║
+██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║
+╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
+
+        PHANTOM VPN ANALYZER v1.0
+=========================================================
+"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" | tee -a $LOG_FILE
+}
+
+check_ipsec() {
+    log "[*] Checking IPSec tunnel states..."
+
+    if command -v ipsec >/dev/null 2>&1; then
+        ipsec statusall >> $LOG_FILE 2>&1
+
+        ESTABLISHED=$(ipsec statusall | grep -c ESTABLISHED)
+
+        if [ "$ESTABLISHED" -gt 0 ]; then
+            log "[+] IPSec Tunnel ESTABLISHED"
+        else
+            log "[!] WARNING: No active IPSec tunnels detected"
+        fi
+    else
+        log "[!] IPSec binary not found"
+    fi
+}
+
+check_packet_loss() {
+    log "[*] Running WAN packet loss test to $PING_TARGET"
+
+    PING_RESULT=$(ping -c 10 $PING_TARGET)
+
+    LOSS=$(echo "$PING_RESULT" | grep -o '[0-9]*% packet loss')
+
+    AVG=$(echo "$PING_RESULT" | tail -1 | awk -F '/' '{print $5}')
+
+    log "[+] Packet Loss: $LOSS"
+    log "[+] Average Latency: ${AVG}ms"
+}
+
+check_peer_reachability() {
+    log "[*] Checking VPN peer reachability ($VPN_PEER)"
+
+    if ping -c 4 $VPN_PEER >/dev/null 2>&1; then
+        log "[+] VPN Peer reachable"
+    else
+        log "[!] VPN Peer unreachable"
+    fi
+}
+
+check_mtu() {
+    log "[*] Performing MTU fragmentation test"
+
+    for SIZE in 1500 1492 1472 1460 1452 1400 1380
+    do
+        ping -M do -s $SIZE -c 1 $MTU_TEST_HOST >/dev/null 2>&1
+
+        if [ $? -eq 0 ]; then
+            log "[+] MTU successful at packet size: $SIZE"
+            break
+        else
+            log "[-] Fragmentation detected at size: $SIZE"
+        fi
+    done
+}
+
+check_dns() {
+    log "[*] Testing DNS resolution"
+
+    DNS_RESULT=$(nslookup google.com 2>/dev/null)
+
+    if echo "$DNS_RESULT" | grep -q "Address"; then
+        DNS_SERVER=$(echo "$DNS_RESULT" | grep Server | awk '{print $2}')
+        log "[+] DNS resolution working via $DNS_SERVER"
+    else
+        log "[!] DNS resolution failed"
+    fi
+}
+
+capture_vpn_flap() {
+    log "[*] Monitoring for tunnel flaps"
+
+    PREV_STATE=""
+
+    while true
+    do
+        CUR_STATE=$(ipsec statusall | grep ESTABLISHED)
+
+        if [ -z "$CUR_STATE" ]; then
+            STATE="DOWN"
+        else
+            STATE="UP"
+        fi
+
+        if [ "$STATE" != "$PREV_STATE" ]; then
+            log "[!] Tunnel state changed: $PREV_STATE -> $STATE"
+
+            tcpdump -i any host $VPN_PEER -c 50 -w $LOG_DIR/vpn_flap_$(date +%s).pcap >/dev/null 2>&1 &
+
+            log "[+] Capturing diagnostic packet capture"
+        fi
+
+        PREV_STATE="$STATE"
+
+        sleep 10
+    done
+}
+
+system_snapshot() {
+    log "[*] Collecting system snapshot"
+
+    echo "========== ROUTES ==========" >> $LOG_FILE
+    ip route >> $LOG_FILE
+
+    echo "========== INTERFACES ==========" >> $LOG_FILE
+    ip addr >> $LOG_FILE
+
+    echo "========== FIREWALL ==========" >> $LOG_FILE
+    iptables -L -v -n >> $LOG_FILE
+
+    echo "========== MEMORY ==========" >> $LOG_FILE
+    free -h >> $LOG_FILE
+
+    echo "========== LOAD ==========" >> $LOG_FILE
+    uptime >> $LOG_FILE
+}
+
+health_score() {
+
+    SCORE=100
+
+    LOSS=$(ping -c 5 $PING_TARGET | grep -o '[0-9]*% packet loss' | cut -d '%' -f1)
+
+    if [ "$LOSS" -gt 10 ]; then
+        SCORE=$((SCORE - 30))
+    fi
+
+    if ! ping -c 2 $VPN_PEER >/dev/null 2>&1; then
+        SCORE=$((SCORE - 40))
+    fi
+
+    if ! nslookup google.com >/dev/null 2>&1; then
+        SCORE=$((SCORE - 20))
+    fi
+
+    log "[+] VPN Health Score: $SCORE/100"
+
+    if [ "$SCORE" -lt 60 ]; then
+        log "[!] CRITICAL: Tunnel health degraded"
+    fi
+}
+
+main() {
+
+    log "===================================================="
+    log "PHANTOM VPN ANALYZER STARTED"
+    log "===================================================="
+
+    system_snapshot
+    check_ipsec
+    check_packet_loss
+    check_peer_reachability
+    check_mtu
+    check_dns
+    health_score
+
+    log "[+] Logs saved to $LOG_FILE"
+
+    capture_vpn_flap
+}
+
+main
